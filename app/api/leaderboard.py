@@ -94,18 +94,44 @@ async def submit_score(
     # 4. Mark session as used
     await mark_session_used(session_id, game_slug, device_id, body.score, started_at)
 
-    # 5. Save to leaderboard
+    # 5. Save to leaderboard (upsert - only keep best score per player/game)
     supabase = get_supabase_client()
     display_name = body.display_name or "Anonymous"
 
-    supabase.table("leaderboards").insert(
-        {
-            "game_slug": game_slug,
-            "device_id": device_id,
-            "display_name": display_name,
-            "score": body.score,
-        }
-    ).execute()
+    # Check if player already has a score for this game
+    existing = (
+        supabase.table("leaderboards")
+        .select("id, score")
+        .eq("game_slug", game_slug)
+        .eq("device_id", device_id)
+        .limit(1)
+        .execute()
+    )
+
+    is_new_best = False
+    if existing.data:
+        # Player has existing score - only update if new score is higher
+        existing_score = existing.data[0]["score"]
+        if body.score > existing_score:
+            supabase.table("leaderboards").update(
+                {
+                    "score": body.score,
+                    "display_name": display_name,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ).eq("id", existing.data[0]["id"]).execute()
+            is_new_best = True
+    else:
+        # No existing score - insert new record
+        supabase.table("leaderboards").insert(
+            {
+                "game_slug": game_slug,
+                "device_id": device_id,
+                "display_name": display_name,
+                "score": body.score,
+            }
+        ).execute()
+        is_new_best = True
 
     # 6. Calculate rank
     rank_result = (
@@ -117,10 +143,15 @@ async def submit_score(
     )
     rank = (rank_result.count or 0) + 1
 
+    if is_new_best:
+        message = f"New personal best! You ranked #{rank}"
+    else:
+        message = f"Score submitted. Your best is still higher. Current rank: #{rank}"
+
     return ScoreSubmitResponse(
         success=True,
         rank=rank,
-        message=f"Score submitted! You ranked #{rank}",
+        message=message,
     )
 
 
