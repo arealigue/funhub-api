@@ -17,6 +17,7 @@ ALLOWED_ORIGINS = [
     "https://fun.kaibigangpt.com",
     "https://mixmo.kaibigangpt.com",
     "https://quizmo.kaibigangpt.com",
+    "https://quizmo-mocha.vercel.app",
 ]
 
 
