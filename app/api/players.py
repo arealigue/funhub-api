@@ -50,13 +50,46 @@ def _fetch_account(account_id: str) -> Optional[dict[str, Any]]:
 @router.post("/register", response_model=PlayerResponse, summary="Register or update a player")
 async def register_player(payload: PlayerRegisterRequest) -> PlayerResponse:
     sb = get_supabase_client()
-    record = {
-        "device_id": payload.device_id,
-        "display_name": payload.display_name or "Anonymous",
-        "last_active_at": datetime.now(timezone.utc).isoformat(),
-    }
-    res = sb.table("players").upsert(record, on_conflict="device_id", returning="representation").execute()
-    player = res.data[0]
+    
+    # Check if player already exists
+    existing = (
+        sb.table("players")
+        .select("*")
+        .eq("device_id", payload.device_id)
+        .limit(1)
+        .execute()
+    )
+    
+    display_name = payload.display_name or "Anonymous"
+    now = datetime.now(timezone.utc).isoformat()
+    
+    if existing.data:
+        # Update existing player
+        player_id = existing.data[0]["id"]
+        res = (
+            sb.table("players")
+            .update({
+                "display_name": display_name,
+                "last_active_at": now,
+                "updated_at": now,
+            })
+            .eq("id", player_id)
+            .execute()
+        )
+        player = res.data[0] if res.data else existing.data[0]
+    else:
+        # Create new player
+        res = (
+            sb.table("players")
+            .insert({
+                "device_id": payload.device_id,
+                "display_name": display_name,
+                "last_active_at": now,
+            })
+            .execute()
+        )
+        player = res.data[0]
+    
     account = _fetch_account(player["account_id"]) if player.get("account_id") else None
     return PlayerResponse(player=player, account=account)
 
