@@ -107,97 +107,105 @@ async def submit_score(
     Requires a valid session token from /games/{game}/start.
     Validates score against anti-cheat rules before saving.
     """
-    if game_slug not in VALID_GAMES:
-        raise HTTPException(status_code=400, detail=f"Invalid game: {game_slug}")
+    try:
+        if game_slug not in VALID_GAMES:
+            raise HTTPException(status_code=400, detail=f"Invalid game: {game_slug}")
 
-    # 1. Verify session token
-    session_data = verify_game_session_token(body.session_token)
+        # 1. Verify session token
+        session_data = verify_game_session_token(body.session_token)
 
-    # Ensure token is for the correct game
-    if session_data.get("game_slug") != game_slug:
-        raise HTTPException(
-            status_code=400,
-            detail="Session token is for a different game",
+        # Ensure token is for the correct game
+        if session_data.get("game_slug") != game_slug:
+            raise HTTPException(
+                status_code=400,
+                detail="Session token is for a different game",
+            )
+
+        session_id = session_data["session_id"]
+        device_id = session_data["device_id"]
+        started_at = session_data["started_at"]
+
+        # 2. Check if session already used
+        if await check_session_used(session_id):
+            raise HTTPException(
+                status_code=400,
+                detail="This game session has already been used",
+            )
+
+        # 3. Validate score (anti-cheat)
+        is_valid, reason = await validate_score(game_slug, body.score, started_at)
+        if not is_valid:
+            raise HTTPException(
+                status_code=400,
+                detail="Score validation failed",
+            )
+
+        # 4. Mark session as used
+        await mark_session_used(session_id, game_slug, device_id, body.score, started_at)
+
+        # 5. Get game_id and player_id
+        supabase = get_supabase_client()
+        display_name = body.display_name or "Anonymous"
+        
+        game_id = await get_game_id(game_slug)
+        player_id = await get_or_create_player(device_id, display_name)
+
+        # 6. Save to leaderboard (upsert - only keep best score per player/game)
+        # Check if player already has a score for this game
+        existing = (
+            supabase.table("leaderboards")
+            .select("id, score")
+            .eq("game_id", game_id)
+            .eq("player_id", player_id)
+            .limit(1)
+            .execute()
         )
 
-    session_id = session_data["session_id"]
-    device_id = session_data["device_id"]
-    started_at = session_data["started_at"]
-
-    # 2. Check if session already used
-    if await check_session_used(session_id):
-        raise HTTPException(
-            status_code=400,
-            detail="This game session has already been used",
-        )
-
-    # 3. Validate score (anti-cheat)
-    is_valid, reason = await validate_score(game_slug, body.score, started_at)
-    if not is_valid:
-        raise HTTPException(
-            status_code=400,
-            detail="Score validation failed",
-        )
-
-    # 4. Mark session as used
-    await mark_session_used(session_id, game_slug, device_id, body.score, started_at)
-
-    # 5. Get game_id and player_id
-    supabase = get_supabase_client()
-    display_name = body.display_name or "Anonymous"
-    
-    game_id = await get_game_id(game_slug)
-    player_id = await get_or_create_player(device_id, display_name)
-
-    # 6. Save to leaderboard (upsert - only keep best score per player/game)
-    # Check if player already has a score for this game
-    existing = (
-        supabase.table("leaderboards")
-        .select("id, score")
-        .eq("game_id", game_id)
-        .eq("player_id", player_id)
-        .limit(1)
-        .execute()
-    )
-
-    is_new_best = False
-    if existing.data:
-        # Player has existing score - only update if new score is higher
-        existing_score = existing.data[0]["score"]
-        if body.score > existing_score:
-            supabase.table("leaderboards").update({
+        is_new_best = False
+        if existing.data:
+            # Player has existing score - only update if new score is higher
+            existing_score = existing.data[0]["score"]
+            if body.score > existing_score:
+                supabase.table("leaderboards").update({
+                    "score": body.score,
+                }).eq("id", existing.data[0]["id"]).execute()
+                is_new_best = True
+        else:
+            # No existing score - insert new record
+            supabase.table("leaderboards").insert({
+                "game_id": game_id,
+                "player_id": player_id,
                 "score": body.score,
-            }).eq("id", existing.data[0]["id"]).execute()
+            }).execute()
             is_new_best = True
-    else:
-        # No existing score - insert new record
-        supabase.table("leaderboards").insert({
-            "game_id": game_id,
-            "player_id": player_id,
-            "score": body.score,
-        }).execute()
-        is_new_best = True
 
-    # 7. Calculate rank
-    rank_result = (
-        supabase.table("leaderboards")
-        .select("id", count="exact")
-        .eq("game_id", game_id)
-        .gt("score", body.score)
-        .execute()
-    )
-    rank = (rank_result.count or 0) + 1
+        # 7. Calculate rank
+        rank_result = (
+            supabase.table("leaderboards")
+            .select("id", count="exact")
+            .eq("game_id", game_id)
+            .gt("score", body.score)
+            .execute()
+        )
+        rank = (rank_result.count or 0) + 1
 
-    if is_new_best:
-        message = f"New personal best! You ranked #{rank}"
-    else:
-        message = f"Score submitted. Your best is still higher. Current rank: #{rank}"
+        if is_new_best:
+            message = f"New personal best! You ranked #{rank}"
+        else:
+            message = f"Score submitted. Your best is still higher. Current rank: #{rank}"
 
-    return ScoreSubmitResponse(
-        success=True,
-        rank=rank,
-        message=message,
-    )
+        return ScoreSubmitResponse(
+            success=True,
+            rank=rank,
+            message=message,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"Error in submit_score: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
 @router.get("/{game_slug}", response_model=LeaderboardResponse)
