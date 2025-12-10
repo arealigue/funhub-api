@@ -3,7 +3,7 @@ Leaderboard API routes.
 Handles score submission with anti-cheat validation and leaderboard retrieval.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -47,6 +47,56 @@ class LeaderboardResponse(BaseModel):
     entries: list[LeaderboardEntry]
 
 
+async def get_or_create_player(device_id: str, display_name: str) -> str:
+    """Get existing player by device_id or create new one. Returns player UUID."""
+    supabase = get_supabase_client()
+    
+    # Check if player exists
+    existing = (
+        supabase.table("players")
+        .select("id")
+        .eq("device_id", device_id)
+        .limit(1)
+        .execute()
+    )
+    
+    if existing.data:
+        player_id = existing.data[0]["id"]
+        # Update display name and last_active
+        supabase.table("players").update({
+            "display_name": display_name,
+            "last_active_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", player_id).execute()
+        return player_id
+    
+    # Create new player
+    result = (
+        supabase.table("players")
+        .insert({
+            "device_id": device_id,
+            "display_name": display_name,
+        })
+        .execute()
+    )
+    return result.data[0]["id"]
+
+
+async def get_game_id(game_slug: str) -> str:
+    """Get game UUID by slug."""
+    supabase = get_supabase_client()
+    result = (
+        supabase.table("games")
+        .select("id")
+        .eq("slug", game_slug)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail=f"Game not found: {game_slug}")
+    return result.data[0]["id"]
+
+
 @router.post("/{game_slug}/submit", response_model=ScoreSubmitResponse)
 @limiter.limit("10/minute")
 async def submit_score(
@@ -84,8 +134,6 @@ async def submit_score(
     # 3. Validate score (anti-cheat)
     is_valid, reason = await validate_score(game_slug, body.score, started_at)
     if not is_valid:
-        # Log suspicious activity but don't reveal exact reason to client
-        # In production, we'd flag this player for review
         raise HTTPException(
             status_code=400,
             detail="Score validation failed",
@@ -94,16 +142,20 @@ async def submit_score(
     # 4. Mark session as used
     await mark_session_used(session_id, game_slug, device_id, body.score, started_at)
 
-    # 5. Save to leaderboard (upsert - only keep best score per player/game)
+    # 5. Get game_id and player_id
     supabase = get_supabase_client()
     display_name = body.display_name or "Anonymous"
+    
+    game_id = await get_game_id(game_slug)
+    player_id = await get_or_create_player(device_id, display_name)
 
+    # 6. Save to leaderboard (upsert - only keep best score per player/game)
     # Check if player already has a score for this game
     existing = (
         supabase.table("leaderboards")
         .select("id, score")
-        .eq("game_slug", game_slug)
-        .eq("device_id", device_id)
+        .eq("game_id", game_id)
+        .eq("player_id", player_id)
         .limit(1)
         .execute()
     )
@@ -113,31 +165,24 @@ async def submit_score(
         # Player has existing score - only update if new score is higher
         existing_score = existing.data[0]["score"]
         if body.score > existing_score:
-            supabase.table("leaderboards").update(
-                {
-                    "score": body.score,
-                    "display_name": display_name,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-            ).eq("id", existing.data[0]["id"]).execute()
+            supabase.table("leaderboards").update({
+                "score": body.score,
+            }).eq("id", existing.data[0]["id"]).execute()
             is_new_best = True
     else:
         # No existing score - insert new record
-        supabase.table("leaderboards").insert(
-            {
-                "game_slug": game_slug,
-                "device_id": device_id,
-                "display_name": display_name,
-                "score": body.score,
-            }
-        ).execute()
+        supabase.table("leaderboards").insert({
+            "game_id": game_id,
+            "player_id": player_id,
+            "score": body.score,
+        }).execute()
         is_new_best = True
 
-    # 6. Calculate rank
+    # 7. Calculate rank
     rank_result = (
         supabase.table("leaderboards")
         .select("id", count="exact")
-        .eq("game_slug", game_slug)
+        .eq("game_id", game_id)
         .gt("score", body.score)
         .execute()
     )
@@ -171,10 +216,13 @@ async def get_leaderboard(
         raise HTTPException(status_code=400, detail=f"Invalid game: {game_slug}")
 
     supabase = get_supabase_client()
+    game_id = await get_game_id(game_slug)
+    
+    # Join leaderboards with players to get display_name
     query = (
         supabase.table("leaderboards")
-        .select("display_name, score, created_at")
-        .eq("game_slug", game_slug)
+        .select("score, created_at, players(display_name)")
+        .eq("game_id", game_id)
         .order("score", desc=True)
         .limit(limit)
     )
@@ -188,7 +236,7 @@ async def get_leaderboard(
         days_since_monday = now.weekday()
         start_of_week = now.replace(
             hour=0, minute=0, second=0, microsecond=0
-        ) - __import__("datetime").timedelta(days=days_since_monday)
+        ) - timedelta(days=days_since_monday)
         query = query.gte("created_at", start_of_week.isoformat())
 
     result = query.execute()
@@ -196,7 +244,7 @@ async def get_leaderboard(
     entries = [
         LeaderboardEntry(
             rank=idx + 1,
-            display_name=row["display_name"],
+            display_name=row.get("players", {}).get("display_name", "Anonymous") if row.get("players") else "Anonymous",
             score=row["score"],
             created_at=row["created_at"],
         )
@@ -224,28 +272,43 @@ async def get_my_rank(
         raise HTTPException(status_code=400, detail=f"Invalid game: {game_slug}")
 
     supabase = get_supabase_client()
-
-    # Get player's best score
-    best_score_result = (
-        supabase.table("leaderboards")
-        .select("score, display_name, created_at")
-        .eq("game_slug", game_slug)
+    game_id = await get_game_id(game_slug)
+    
+    # Get player by device_id
+    player_result = (
+        supabase.table("players")
+        .select("id, display_name")
         .eq("device_id", device_id)
-        .order("score", desc=True)
+        .limit(1)
+        .execute()
+    )
+    
+    if not player_result.data:
+        return {"has_score": False, "message": "No scores found for this player"}
+    
+    player = player_result.data[0]
+    player_id = player["id"]
+
+    # Get player's score for this game
+    score_result = (
+        supabase.table("leaderboards")
+        .select("score, created_at")
+        .eq("game_id", game_id)
+        .eq("player_id", player_id)
         .limit(1)
         .execute()
     )
 
-    if not best_score_result.data:
+    if not score_result.data:
         return {"has_score": False, "message": "No scores found for this player"}
 
-    best = best_score_result.data[0]
+    best = score_result.data[0]
 
     # Calculate rank
     rank_result = (
         supabase.table("leaderboards")
         .select("id", count="exact")
-        .eq("game_slug", game_slug)
+        .eq("game_id", game_id)
         .gt("score", best["score"])
         .execute()
     )
@@ -255,6 +318,6 @@ async def get_my_rank(
         "has_score": True,
         "rank": rank,
         "score": best["score"],
-        "display_name": best["display_name"],
+        "display_name": player["display_name"],
         "achieved_at": best["created_at"],
     }
