@@ -13,12 +13,10 @@ ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:3001",
     "http://localhost:3002",
-    "https://quizmo.fun",
-    "https://www.quizmo.fun",
-    "https://mixmo.fun",
-    "https://www.mixmo.fun",
-    "https://funhub.fun",
-    "https://www.funhub.fun",
+    "https://funhub-api-backend-y2025",
+    "https://fun.kaibigangpt.com",
+    "https://mixmo.kaibigangpt.com",
+    "https://quizmo.kaibigangpt.com",
 ]
 
 
