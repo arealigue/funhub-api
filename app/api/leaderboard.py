@@ -125,8 +125,8 @@ async def submit_score(
         device_id = session_data["device_id"]
         started_at = session_data["started_at"]
 
-        # 2. Check if session already used
-        if await check_session_used(session_id):
+        # 2. Check if session already used (use the actual token for lookup)
+        if await check_session_used(body.session_token):
             raise HTTPException(
                 status_code=400,
                 detail="This game session has already been used",
@@ -140,8 +140,8 @@ async def submit_score(
                 detail="Score validation failed",
             )
 
-        # 4. Mark session as used
-        await mark_session_used(session_id, game_slug, device_id, body.score, started_at)
+        # 4. Mark session as used (use the actual token)
+        await mark_session_used(body.session_token, game_slug, device_id, body.score, started_at)
 
         # 5. Get game_id and player_id
         supabase = get_supabase_client()

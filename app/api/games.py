@@ -136,34 +136,70 @@ async def validate_score(game_slug: str, score: int, started_at: float) -> tuple
     return True, "Valid"
 
 
-async def check_session_used(session_id: str) -> bool:
+async def check_session_used(session_token: str) -> bool:
     """Check if a game session has already been used to submit a score."""
     supabase = get_supabase_client()
     result = (
         supabase.table("game_sessions")
         .select("id")
-        .eq("session_id", session_id)
+        .eq("session_token", session_token)
         .execute()
     )
     return len(result.data) > 0
 
 
+async def get_player_id_by_device(device_id: str) -> str | None:
+    """Get player UUID by device_id."""
+    supabase = get_supabase_client()
+    result = (
+        supabase.table("players")
+        .select("id")
+        .eq("device_id", device_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        return None
+    return result.data[0]["id"]
+
+
+async def get_game_id_by_slug(game_slug: str) -> str | None:
+    """Get game UUID by slug."""
+    supabase = get_supabase_client()
+    result = (
+        supabase.table("games")
+        .select("id")
+        .eq("slug", game_slug)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        return None
+    return result.data[0]["id"]
+
+
 async def mark_session_used(
-    session_id: str, game_slug: str, device_id: str, score: int, started_at: float
+    session_token: str, game_slug: str, device_id: str, score: int, started_at: float
 ):
     """Mark a game session as used after score submission."""
     supabase = get_supabase_client()
     ended_at = datetime.now(timezone.utc)
-    duration = int(ended_at.timestamp() - started_at)
+    
+    # Get player_id and game_id
+    player_id = await get_player_id_by_device(device_id)
+    game_id = await get_game_id_by_slug(game_slug)
+    
+    if not player_id or not game_id:
+        # Can't mark session without valid player/game, but don't fail
+        return
 
     supabase.table("game_sessions").insert(
         {
-            "session_id": session_id,
-            "game_slug": game_slug,
-            "device_id": device_id,
+            "session_token": session_token,
+            "player_id": player_id,
+            "game_id": game_id,
             "score": score,
             "started_at": datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat(),
             "ended_at": ended_at.isoformat(),
-            "duration_seconds": duration,
         }
     ).execute()
